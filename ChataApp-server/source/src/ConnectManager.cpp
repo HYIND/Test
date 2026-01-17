@@ -1,8 +1,9 @@
 #include "ConnectManager.h"
+#include "FileTransManager.h"
 
 void ConnectManager::callBackSessionEstablish(BaseNetWorkSession *session)
 {
-    session->BindRecvDataCallBack(std::bind(&ConnectManager::callBackRecvMessage, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+    session->BindRecvDataCallBack(std::bind(&ConnectManager::callBackRecvMessage, this, std::placeholders::_1, std::placeholders::_2));
     session->BindSessionCloseCallBack(std::bind(&ConnectManager::callBackCloseConnect, this, std::placeholders::_1));
     sessions.emplace(session);
 
@@ -17,7 +18,7 @@ void ConnectManager::callBackSessionEstablish(BaseNetWorkSession *session)
     }
 }
 
-void ConnectManager::callBackRecvMessage(BaseNetWorkSession *basesession, Buffer *recv, Buffer *response)
+void ConnectManager::callBackRecvMessage(BaseNetWorkSession *basesession, Buffer *recv)
 {
     CustomTcpSession *session = (CustomTcpSession *)basesession;
 
@@ -26,7 +27,7 @@ void ConnectManager::callBackRecvMessage(BaseNetWorkSession *basesession, Buffer
 
     bool success = false;
     if (HandleMsg)
-        HandleMsg->ProcessMsg(session, session->GetIPAddr(), session->GetPort(), recv);
+        HandleMsg->ProcessMsg(session, recv);
     if (success)
     {
     }
@@ -38,12 +39,10 @@ void ConnectManager::callBackCloseConnect(BaseNetWorkSession *session)
     std::cout << fmt::format("Client Connection Close: RemoteIpAddr={}:{} \n",
                              session->GetIPAddr(), session->GetPort());
 
-    bool success = false;
     if (HandleLoginUser)
-        HandleLoginUser->Logout(session, "logouttoken", session->GetIPAddr(), session->GetPort());
-    if (success)
-    {
-    }
+        HandleLoginUser->Logout(session, session->GetIPAddr(), session->GetPort());
+
+    FILETRANSMANAGER->SessionClose(session);
 
     sessions.EnsureCall(
         [&](std::vector<BaseNetWorkSession *> &array) -> void

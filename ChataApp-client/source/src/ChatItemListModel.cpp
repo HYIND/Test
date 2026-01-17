@@ -188,7 +188,7 @@ void ChatItemListModel::addNewMsg(const QString& goaltoken,const ChatMsg& chatms
     if(SESSIONMODEL->sessionToken()==itemtoken)
         SESSIONMODEL->addMessage(chatmsg);
 
-    if (chatmsg.type == MsgType::file)
+    if (chatmsg.type == MsgType::file || chatmsg.type == MsgType::picture)
     {
         if(USERINFOMODEL->isMyToken(chatmsg.srctoken))
         {
@@ -202,6 +202,11 @@ void ChatItemListModel::addNewMsg(const QString& goaltoken,const ChatMsg& chatms
     }
 }
 
+void ChatItemListModel::sendMsgError()
+{
+    emit msgError();
+}
+
 void ChatItemListModel::fileTransProgressChange(const QString &fileid, uint32_t progress)
 {
     bool find = false;
@@ -212,7 +217,7 @@ void ChatItemListModel::fileTransProgressChange(const QString &fileid, uint32_t 
             break;
         for(auto & msg:m_chatitems[i].chatmsgs)
         {
-            if(msg.type!=MsgType::file)
+            if(msg.type!=MsgType::file && msg.type!=MsgType::picture)
                 continue;
             if(msg.fileid == fileid)
             {
@@ -241,7 +246,7 @@ void ChatItemListModel::fileTransInterrupted(const QString &fileid)
             break;
         for(auto & msg:m_chatitems[i].chatmsgs)
         {
-            if(msg.type!=MsgType::file)
+            if(msg.type!=MsgType::file && msg.type!=MsgType::picture)
                 continue;
             if(msg.fileid == fileid)
             {
@@ -269,7 +274,7 @@ void ChatItemListModel::fileTransFinished(const QString &fileid)
             break;
         for(auto & msg:m_chatitems[i].chatmsgs)
         {
-            if(msg.type!=MsgType::file)
+            if(msg.type!=MsgType::file && msg.type!=MsgType::picture)
                 continue;
             if(msg.fileid == fileid)
             {
@@ -299,7 +304,7 @@ void ChatItemListModel::fileTransError(const QString &fileid)
             break;
         for(auto & msg:m_chatitems[i].chatmsgs)
         {
-            if(msg.type!=MsgType::file)
+            if(msg.type!=MsgType::file && msg.type!=MsgType::picture)
                 continue;
             if(msg.fileid == fileid)
             {

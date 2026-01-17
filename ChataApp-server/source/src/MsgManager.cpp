@@ -13,7 +13,7 @@ int64_t GetTimeStampSecond()
     return second;
 }
 
-bool MsgManager::ProcessMsg(BaseNetWorkSession *session, string ip, uint16_t port, Buffer *buf)
+bool MsgManager::ProcessMsg(BaseNetWorkSession *session, Buffer *buf)
 {
     MessagePackage package;
     if (!AnalysisMessagePackageFromBuffer(buf, &package))
@@ -32,27 +32,28 @@ bool MsgManager::ProcessMsg(BaseNetWorkSession *session, string ip, uint16_t por
     if (command == 7000 || command == 7001 || command == 7010 || command == 7080 || command == 7070 ||
         command == 8000 || command == 8001 || command == 8010 || command == 4001)
     {
-        FILETRANSMANAGER->ProcessMsg(session, ip, port, js_src, buf_src);
+        FILETRANSMANAGER->ProcessMsg(session, js_src, buf_src);
     }
 
-    if (!js_src.contains("token"))
+    if (!js_src.contains("jwt"))
         return false;
-    string token = js_src["token"];
+    string jwtstr = js_src["jwt"];
+    string token;
 
     bool success = false;
     if (HandleLoginUser)
-        success = HandleLoginUser->Verfiy(session, token);
+        success = HandleLoginUser->Verfiy(session, jwtstr, token);
     if (success)
     {
         if (js_src.contains("command"))
         {
             if (command == 1001)
             {
-                SendOnlineUserMsg(session, token, ip, port);
+                SendOnlineUserMsg(session, token);
             }
             if (command == 1002)
             {
-                ProcessChatMsg(session, token, ip, port, js_src, buf_src);
+                ProcessChatMsg(session, token, js_src, buf_src);
             }
             if (command == 1003)
             {
@@ -63,12 +64,8 @@ bool MsgManager::ProcessMsg(BaseNetWorkSession *session, string ip, uint16_t por
     return success;
 }
 
-bool MsgManager::ProcessChatMsg(BaseNetWorkSession *session, string token, string ip, uint16_t port, json &js_src, Buffer &buf)
+bool MsgManager::ProcessChatMsg(BaseNetWorkSession *session, const string &token, json &js_src, Buffer &buf)
 {
-    if (!js_src.contains("token"))
-    {
-        return false;
-    }
     if (!js_src.contains("goaltoken"))
     {
         return false;
@@ -78,7 +75,7 @@ bool MsgManager::ProcessChatMsg(BaseNetWorkSession *session, string token, strin
         return false;
     }
 
-    string srctoken = js_src["token"];
+    string srctoken = token;
     string goaltoken = js_src["goaltoken"];
 
     if (HandleLoginUser->IsPublicChat(goaltoken))
@@ -87,7 +84,7 @@ bool MsgManager::ProcessChatMsg(BaseNetWorkSession *session, string token, strin
         return ForwardChatMsg(srctoken, goaltoken, js_src, buf);
 }
 
-bool MsgManager::BroadCastPublicChatMsg(string token, json &js_src, Buffer &buf)
+bool MsgManager::BroadCastPublicChatMsg(const string &token, json &js_src, Buffer &buf)
 {
     if (!js_src.contains("msg"))
         return false;
@@ -116,7 +113,7 @@ bool MsgManager::BroadCastPublicChatMsg(string token, json &js_src, Buffer &buf)
     if (type == MsgType::picture && buf.Length() > 0)
         msg = string(buf.Byte(), buf.Length());
 
-    if (type == MsgType::file)
+    if (type == MsgType::file || type == MsgType::picture)
     {
         string filename = js_src["filename"];
         uint64_t filesize = js_src["filesize"];
@@ -137,6 +134,7 @@ bool MsgManager::BroadCastPublicChatMsg(string token, json &js_src, Buffer &buf)
                 .ip = sender->ip,
                 .port = sender->port,
                 .type = type,
+                .msg = msg,
                 .filename = filename,
                 .filesize = filesize,
                 .md5 = md5,
@@ -171,14 +169,22 @@ bool MsgManager::BroadCastPublicChatMsg(string token, json &js_src, Buffer &buf)
     return true;
 }
 
-bool MsgManager::ForwardChatMsg(string srctoken, string goaltoken, json &js_src, Buffer &buf_src)
+bool MsgManager::ForwardChatMsg(const string &srctoken, const string &goaltoken, json &js_src, Buffer &buf_src)
 {
     if (!js_src.contains("msg"))
         return false;
 
     User *sender = nullptr;
     User *recver = nullptr;
-    if (!HandleLoginUser->FindByToken(srctoken, sender) || !HandleLoginUser->FindByToken(goaltoken, recver))
+    bool result = HandleLoginUser->FindByToken(srctoken, sender) && HandleLoginUser->FindByToken(goaltoken, recver);
+    if (sender)
+    {
+        json js;
+        js["command"] = 2002;
+        js["result"] = result;
+        NetWorkHelper::SendMessagePackage(sender->session, &js);
+    }
+    if (!result)
         return false;
 
     MsgType type = (MsgType)(js_src["type"]);
@@ -199,7 +205,7 @@ bool MsgManager::ForwardChatMsg(string srctoken, string goaltoken, json &js_src,
     if (type == MsgType::picture && buf_src.Length() > 0)
         msg = string(buf_src.Byte(), buf_src.Length());
 
-    if (type == MsgType::file)
+    if (type == MsgType::file || type == MsgType::picture)
     {
         string filename = js_src["filename"];
         uint64_t filesize = js_src["filesize"];
@@ -220,6 +226,10 @@ bool MsgManager::ForwardChatMsg(string srctoken, string goaltoken, json &js_src,
                 .ip = sender->ip,
                 .port = sender->port,
                 .type = type,
+                .msg = msg,
+                .filename = filename,
+                .filesize = filesize,
+                .md5 = md5,
                 .fileid = fileid});
     }
     else
@@ -242,7 +252,7 @@ bool MsgManager::ForwardChatMsg(string srctoken, string goaltoken, json &js_src,
     return true;
 }
 
-bool MsgManager::SendOnlineUserMsg(BaseNetWorkSession *session, string token, string ip, uint16_t port)
+bool MsgManager::SendOnlineUserMsg(BaseNetWorkSession *session, const string &token)
 {
     auto &Users = HandleLoginUser->GetOnlineUsers();
 
@@ -269,12 +279,10 @@ bool MsgManager::SendOnlineUserMsg(BaseNetWorkSession *session, string token, st
 
     js["users"] = js_users;
 
-    NetWorkHelper::SendMessagePackage(session, &js);
-
-    return true;
+    return NetWorkHelper::SendMessagePackage(session, &js);
 }
 
-bool MsgManager::ProcessFetchRecord(BaseNetWorkSession *session, string token, json &js_src, Buffer &buf_src)
+bool MsgManager::ProcessFetchRecord(BaseNetWorkSession *session, const string &token, json &js_src, Buffer &buf_src)
 {
     if (!js_src.contains("goaltoken"))
         return false;
@@ -312,7 +320,7 @@ bool MsgManager::ProcessFetchRecord(BaseNetWorkSession *session, string token, j
             js_record["msg"] = msgrecord.msg;
         }
 
-        if (msgrecord.type == MsgType::file)
+        if (msgrecord.type == MsgType::file || msgrecord.type == MsgType::picture)
         {
             js_record["filename"] = msgrecord.filename;
             js_record["filesize"] = msgrecord.filesize;

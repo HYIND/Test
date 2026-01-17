@@ -4,13 +4,55 @@
 #include <string>
 #include <vector>
 #include <QDebug>
+#include <random>
 #include "LlamaToolHelper.h"
+
+static int global_n_ctx = 20000;
+
+class LlamaModelLoader{
+public:
+    static LlamaModelLoader* Instance();
+
+private:
+    LlamaModelLoader();
+
+public:
+    bool load(const std::string& model_path);
+    bool isLoaded();
+    llama_model* Model();
+
+    ~LlamaModelLoader();
+private:
+    llama_model *m_model = nullptr;
+};
 
 int64_t GetTimestampMilliseconds()
 {
     auto now = std::chrono::system_clock::now();
     auto duration = now.time_since_epoch();
     return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+}
+
+std::string generate_random_string_16() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    // 定义字符集（可以根据需要调整）
+    const std::string charset =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz";
+
+    std::uniform_int_distribution<> dis(0, charset.size() - 1);
+
+    std::string result;
+    result.reserve(16);  // 预分配空间
+
+    for (int i = 0; i < 16; ++i) {
+        result.push_back(charset[dis(gen)]);
+    }
+
+    return result;
 }
 
 // Qwen特殊token映射表
@@ -97,18 +139,17 @@ bool isStringEndsWithCompleteUTF8(const std::string& str) {
     return false;
 }
 
-static llama_seq_id default_seq_id = 0;
-
 std::string system_template = R"(
 You are an helpful AI assistant built into a chat application.
 You are part of the user interface and your respond need to conform to the style of the chat application assistant.
 Important: Once you have finished thinking, you must immediately take one of the following actions:
-1. Call a tool: Use the `<tool_call>` format
+1. If you need call a tool: Use the `<tool_call>` format
 2. For tool such as time, weather, contact information, and message sending, the tool must be invoked again to retrieve the latest data each time.Do not use old data from the conversation history, even if the questions seem the same.
-3. Never do nothing after thinking.
+3. When tools are not needed, respond directly and helpfully.
+4. You should never reveal the name of your tool to users.
 )";
 
-std::string stringreplace(const std::string& str,
+static std::string stringreplace(const std::string& str,
                     const std::string& from,
                     const std::string& to) {
     std::string result = str;
@@ -118,21 +159,6 @@ std::string stringreplace(const std::string& str,
         result.replace(start_pos, from.length(), to);
         start_pos += to.length(); // 避免无限循环
     }
-
-    return result;
-}
-
-std::string convertEscapedNewlines(std::string& input) {
-    std::string result = input;
-    size_t pos = 0;
-
-    while ((pos = result.find("\\n", pos)) != std::string::npos) {
-        // 替换 \\n 为真正的换行符
-        result.replace(pos, 2, "\n");
-        pos += 1; // 移动到替换后的位置
-    }
-    input = stringreplace(input,"\\n","\n");
-    input = stringreplace(input,"\n\n","\n");
 
     return result;
 }
@@ -168,130 +194,45 @@ bool containsToolCall(const std::string& text) {
     return start_pos != std::string::npos && end_pos != std::string::npos;
 }
 
-ToolCall parseToolCall(const std::string& text) {
-    size_t start_pos = text.find("<tool_call>");
-    size_t end_pos = text.find("</tool_call>");
+std::vector<ToolCall> parseToolCall(const std::string& text) {
+    std::vector<ToolCall> result;
+    size_t find_pos = 0;
 
-    if (start_pos != std::string::npos && end_pos != std::string::npos) {
-        std::string json_str = text.substr(start_pos + 11, end_pos - start_pos - 11);
-        // 移除空白字符
+    auto isrepeat = [](std::vector<ToolCall>& vec, ToolCall& elment)-> bool
+    {
+        for(auto &call: vec)
+        {
+            if(call.is_same_as(elment))
+                return true;
+        }
+        return false;
+    };
 
-        json_str.erase(std::remove_if(json_str.begin(), json_str.end(),
-                                      [](char c) { return c ==' '; }),
-                       json_str.end());
-        return ToolCall::from_json(json_str);
-    }
+    do{
+        size_t start_pos = text.find("<tool_call>",find_pos);
+        size_t end_pos = text.find("</tool_call>",find_pos);
 
-    return ToolCall{};
+        if (start_pos != std::string::npos && end_pos != std::string::npos && end_pos > start_pos) {
+            std::string json_str = text.substr(start_pos + 11, end_pos - start_pos - 11);
+            // 移除空白字符
+            json_str.erase(0, json_str.find_first_not_of(" \n\r\t"));
+            json_str.erase(json_str.find_last_not_of(" \n\r\t") + 1);
+            auto toolcall = ToolCall::from_json(json_str);
+            if(!isrepeat(result,toolcall))
+                result.emplace_back(toolcall);
+            find_pos = end_pos + sizeof("</tool_call>") - 1;
+        }
+        else
+        {
+            break;
+        }
+    }  while(true);
+
+    return result;
 }
 
 std::string formatToolResponse(const std::string& result) {
     return "\n<tool_response>\n" + result + "\n</tool_response>\n";
-}
-
-// 构建Qwen ChatML格式的prompt
-std::string buildQwenPrompt(
-    const std::vector<llamaChatMsg>& messages,
-    const std::vector<Tool>& tools = {},
-    bool add_generation_prompt = true,
-    bool enable_thinking = true) {
-
-    std::ostringstream oss;
-
-    // 1. 处理工具定义（如果有工具）
-    if (!tools.empty()) {
-        oss << "<|im_start|>system\n";
-
-        // 如果有系统消息，先添加
-        if (!messages.empty() && messages[0].role == "system") {
-            oss << messages[0].content << "\n\n";
-        }
-
-        oss << "# Tools\n\n";
-        oss << "You may call one or more functions to assist with the user query.\n\n";
-        oss << "You are provided with function signatures within <tools></tools> XML tags:\n";
-        oss << "<tools>\n";
-
-        for (const auto& tool : tools) {
-            oss << tool.to_json() << "\n";
-        }
-
-        oss << "</tools>\n\n";
-        oss << "For each function call, return a json object with function name and arguments ";
-        oss << "within <tool_call></tool_call> XML tags:\n";
-        oss << "<tool_call>\n";
-        oss << "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n";
-        oss << "</tool_call><|im_end|>\n";
-
-        // 如果不是以系统消息开头，添加用户消息
-        if (messages.empty() || messages[0].role != "system") {
-            for (const auto& msg : messages) {
-                if (msg.role == "user") {
-                    oss << "<|im_start|>user\n" << msg.content << "<|im_end|>\n";
-                    break;
-                }
-            }
-        }
-    } else {
-        // 2. 没有工具，只有系统消息
-        if (!messages.empty() && messages[0].role == "system") {
-            oss << "<|im_start|>system\n" << messages[0].content << "<|im_end|>\n";
-        }
-    }
-
-    // 3. 查找最后一个用户查询的位置（用于判断是否添加思考）
-    int last_query_index = -1;
-    bool found_non_tool_user = false;
-
-    // 反向遍历找到最后一个非工具响应的用户消息
-    for (int i = messages.size() - 1; i >= 0; i--) {
-        if (messages[i].role == "user") {
-            // 检查是否是工具响应
-            const std::string& content = messages[i].content;
-            bool is_tool_response = content.find("<tool_response>") == 0;
-
-            if (!is_tool_response) {
-                last_query_index = i;
-                found_non_tool_user = true;
-                break;
-            }
-        }
-    }
-
-    // 4. 处理所有消息（跳过已处理的消息）
-    int start_index = (tools.empty() || messages.empty() || messages[0].role != "system") ? 0 : 1;
-
-    for (size_t i = start_index; i < messages.size(); i++) {
-        const auto& msg = messages[i];
-        if (msg.role == "user") {
-            // 用户消息
-            oss << "<|im_start|>user\n";
-            oss << msg.content;
-            oss << "<|im_end|>\n";
-
-        } else if (msg.role == "assistant") {
-            // 助手消息
-            oss << "<|im_start|>assistant\n";
-            oss << msg.content;
-            oss << "<|im_end|>\n";
-        } else if (msg.role == "tool") {
-            if(msg.out_time < GetTimestampMilliseconds())
-                continue;
-            oss << "<|im_start|>user\n";
-            oss << msg.content;
-            oss << "<|im_end|>\n";
-        }
-    }
-
-    // 5. 添加生成提示
-    if (add_generation_prompt) {
-        oss << "<|im_start|>assistant\n";
-        if (!enable_thinking) {
-            oss << "<think>\n\n</think>\n\n";
-        }
-    }
-
-    return oss.str();
 }
 
 bool isThinkingComplete(const std::string& output) {
@@ -321,6 +262,42 @@ bool hasFinalResponse(const std::string& output) {
     after_think.erase(0, after_think.find_first_not_of(" \n\r\t"));
     return !after_think.empty();
 }
+
+static auto gettokenize = [](const std::string& prompt,const llama_vocab* vocab)->std::vector<llama_token>{
+    if(!vocab)
+        return {};
+
+    std::vector<llama_token> tokens;
+    tokens.resize(prompt.size() + 3);
+
+    int n_tokens = llama_tokenize(
+        vocab,
+        prompt.c_str(),
+        prompt.length(),
+        tokens.data(),
+        tokens.size(),
+        false,
+        true
+        );
+
+    if (n_tokens < 0) {
+        tokens.resize(-n_tokens);
+        n_tokens = llama_tokenize(
+            vocab,
+            prompt.c_str(),
+            prompt.length(),
+            tokens.data(),
+            tokens.size(),
+            false,
+            true
+            );
+    }
+
+    if(n_tokens!=tokens.size())
+        tokens.resize(n_tokens);
+
+    return tokens;
+};
 
 bool LlamaModel::shouldStopGeneration(llama_token& token, const std::string& current_output) {
     static std::unordered_map<llama_token, std::string> stop_token_map = {
@@ -357,54 +334,55 @@ bool LlamaModel::shouldStopGeneration(llama_token& token, const std::string& cur
     return false;
 }
 
+void ClientHandle::ClearPausedTask()
+{
+    if(m_inputtask.empty())
+        return;
+
+    AITask quetask;
+    while(m_inputtask.front(quetask))
+    {
+        if(quetask.taskstate != TaskState::Normal)
+        {
+            if(!quetask.output.empty())
+            {
+                llamaChatMsg newmsg("assistant",quetask.output);
+                m_chathistory.emplace_back(newmsg);
+            }
+            m_inputtask.dequeue(quetask);
+        }
+    }
+    std::string endstr = "<|im_end|>\n";
+    auto endtokens = gettokenize(endstr,m_vocab);
+    m_curtokens.insert(m_curtokens.end(),endtokens.begin(),endtokens.end());
+}
+
+LlamaModel *LlamaModel::Instance()
+{
+    static LlamaModel* m_instance = new LlamaModel();
+    return m_instance;
+}
+
 bool LlamaModel::load(const std::string& model_path) {
-    // 1. 检查文件是否存在
-    FILE* test = fopen(model_path.c_str(), "rb");
-    if (!test) {
-        qDebug()<<("错误: 找不到模型文件: %s\n", model_path.c_str());
+
+    bool success = LlamaModelLoader::Instance()->load(model_path);
+    if(!success)
         return false;
-    }
-    fclose(test);
 
-    qDebug()<<("正在加载模型: %s\n", model_path.c_str());
+    const llama_model* model = LlamaModelLoader::Instance()->Model();
 
-    // 2. 使用默认参数
-    llama_model_params mparams = llama_model_default_params();
-    llama_context_params cparams = llama_context_default_params();
-
-    // 3. 加载模型
-    m_model = llama_model_load_from_file(model_path.c_str(), mparams);
-    if (!m_model) {
-        qDebug()<<("错误: 模型加载失败\n");
-        return false;
-    }
-
-    // 4. 创建上下文
-    m_ctx = llama_init_from_model(m_model, cparams);
-    if (!m_ctx) {
-        qDebug()<<("错误: 上下文创建失败\n");
-        llama_model_free(m_model);
-        m_model = nullptr;
-        return false;
-    }
-
-    m_vocab =  llama_model_get_vocab(m_model);
+    m_vocab =  llama_model_get_vocab(model);
     if (!m_vocab) {
         qDebug()<<("错误: 词汇表创建失败\n");
         llama_free(m_ctx);
         m_ctx = nullptr;
-        llama_model_free(m_model);
-        m_model = nullptr;
         return false;
     }
 
+    resetcontext();
+
     m_loaded = true;
     qDebug()<<("模型加载成功！\n");
-    qDebug()<<("上下文长度: %d\n", llama_n_ctx((llama_context*)m_ctx));
-
-    m_chathistory.emplace_back(
-        "system",
-        system_template);
 
     // for(llama_token token = 151643;token<=151668;token++)
     // {
@@ -418,193 +396,432 @@ bool LlamaModel::load(const std::string& model_path) {
     return true;
 }
 
-enum class GenerateState {
-    thinking = 0,
-    talking = 2,
-};
-
-bool LlamaModel::processTask(const std::string &user_input)
+bool LlamaModel::processTask(AITask &task)
 {
-    GenerateState state = GenerateState::talking;
-    bool onusetool = false;
-    bool firstoutputthinkingtext = true;
-    bool firstoutputtalkingtext = true;
 
+    if(task.taskstate == TaskState::Normal)
+    {
+        llamaChatMsg msg("user",task.userinput);
+        msg.usethinking = task.needthinking;
+        task.handle->m_chathistory.emplace_back(msg);
+    }
 
-    m_chathistory.emplace_back("user",user_input);
-
-    std::string output;
-    int lastoutputpos = output.length();
+    int lastoutputpos = task.output.length();
 
     auto outputchange = [&]()->void{
-        int outputpos = output.length();
-        std::string delta(output.begin()+lastoutputpos,output.begin()+outputpos);
+        int outputpos = task.output.length();
+        std::string trimstring(task.output.begin()+lastoutputpos,task.output.begin()+outputpos);
 
-        if( state != GenerateState::thinking && delta.find("<think>") != std::string::npos)
-        {
-            state = GenerateState::thinking;
-            lastoutputpos = outputpos;
-            return;
-        }
-        if(state == GenerateState::thinking && delta.find("</think>") != std::string::npos)
-        {
-            state = GenerateState::talking;
-            lastoutputpos = outputpos;
-            return;
-        }
-        if(!onusetool && delta.find("<tool_call>") != std::string::npos)
-        {
-            onusetool = true;
-            if(state != GenerateState::thinking)
-            {
-                lastoutputpos = outputpos;
-                return;
-            }
-        }
+        auto slipttext = [](const std::string& text)-> std::vector<std::string> {
+            static std::vector<std::string> keystip = {
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "</tool_call>"
+            };
 
-        if(state == GenerateState::thinking)
-        {
-            if(firstoutputthinkingtext)
-                delta = trimLeadingWhitespace(delta);
-            if(!delta.empty() && isStringEndsWithCompleteUTF8(delta))
-            {
-                if(firstoutputthinkingtext)
-                    delta = "思考内容：\n" + delta;
-                QString outputdelta = QString::fromStdString(delta);
-                emit outputText(outputdelta, false);
-                firstoutputthinkingtext = false;
-                lastoutputpos = outputpos;
+            std::vector<std::string> paragraphs;
+            size_t pos = 0;
+
+            while (pos < text.length()) {
+                // 查找下一个关键标签的位置
+                size_t next_tag_pos = std::string::npos;
+                std::string found_tag;
+
+                for (const auto& tag : keystip) {
+                    size_t tag_pos = text.find(tag, pos);
+                    if (tag_pos != std::string::npos) {
+                        if (next_tag_pos == std::string::npos || tag_pos < next_tag_pos) {
+                            next_tag_pos = tag_pos;
+                            found_tag = tag;
+                        }
+                    }
+                }
+
+                if (next_tag_pos == std::string::npos) {
+                    // 没有更多标签，添加剩余部分
+                    if (pos < text.length()) {
+                        std::string remaining = text.substr(pos);
+                        if (!remaining.empty()) {
+                            paragraphs.push_back(remaining);
+                        }
+                    }
+                    break;
+                }
+
+                // 添加标签前的内容（如果有）
+                if (next_tag_pos > pos) {
+                    std::string before_tag = text.substr(pos, next_tag_pos - pos);
+                    if (!before_tag.empty()) {
+                        paragraphs.push_back(before_tag);
+                    }
+                }
+
+                // 添加标签本身
+                paragraphs.push_back(found_tag);
+
+                // 更新位置到标签结束处
+                pos = next_tag_pos + found_tag.length();
             }
-        }
-        else if(state == GenerateState::talking && !onusetool)
+
+            return paragraphs;
+        };
+
+        std::vector<std::string> texts = slipttext(trimstring);
+
+        for(int i=0; i<texts.size(); i++)
         {
-            if(firstoutputtalkingtext)
-                delta = trimLeadingWhitespace(delta);
-            if(!delta.empty() && isStringEndsWithCompleteUTF8(delta))
+            std::string delta = texts[i];
+            uint32_t oristrlen = delta.length();
+            if(task.state != GenerateState::thinking && delta.find("<think>") != std::string::npos)
             {
-                if(firstoutputtalkingtext)
-                    delta = "\n输出内容：\n" + delta;
+                if(task.laststate == GenerateState::none)
+                    delta = "-----------------think start-----------------\n\n";
+                else
+                    delta = "\n\n-----------------think start-----------------\n\n";
                 QString outputdelta = QString::fromStdString(delta);
-                emit outputText(outputdelta, false);
-                firstoutputtalkingtext = false;
-                lastoutputpos = outputpos;
+
+                if(task.handle->outputtextcallback)
+                    task.handle->outputtextcallback(outputdelta,1);
+
+                task.laststate = task.state;
+                task.state = GenerateState::thinking;
+                task.firstoutputthinkingtext = true;
+
+                lastoutputpos += oristrlen;
+                continue;
+            }
+            if(task.state == GenerateState::thinking && delta.find("</think>") != std::string::npos)
+            {
+                delta = "\n\n-----------------think over-----------------\n\n";
+                QString outputdelta = QString::fromStdString(delta);
+
+                if(task.handle->outputtextcallback)
+                    task.handle->outputtextcallback(outputdelta,1);
+
+                task.laststate = task.state;
+                task.state = GenerateState::talking;
+
+                lastoutputpos += oristrlen;
+                continue;
+            }
+            if(delta.find("<tool_call>") != std::string::npos)
+            {
+                if(!task.onusetool)
+                    task.onusetool = true;
+
+                if(
+                    (task.state == GenerateState::thinking && task.firstoutputthinkingtext) ||
+                    (task.state == GenerateState::talking && task.firstoutputtalkingtext)
+                    )
+                    delta = "------------toolcall start------------\n";
+                else
+                {
+                    delta = "\n------------toolcall start------------\n";
+                }
+                QString outputdelta = QString::fromStdString(delta);
+
+                if(task.handle->outputtextcallback)
+                    task.handle->outputtextcallback(outputdelta,1);
+
+                task.laststate = task.state;
+                task.state = GenerateState::toolusing;
+                task.firstoutputtoolusingtext = true;
+
+                lastoutputpos += oristrlen;
+                continue;
+            }
+            if(task.state == GenerateState::toolusing && delta.find("</tool_call>") != std::string::npos)
+            {
+                task.state = task.laststate;
+                task.laststate = GenerateState::toolusing;
+
+                delta = "\n------------toolcall over------------\n";
+                QString outputdelta = QString::fromStdString(delta);
+
+                if(task.handle->outputtextcallback)
+                    task.handle->outputtextcallback(outputdelta,1);
+
+                lastoutputpos += oristrlen;
+                continue;
+            }
+
+            if(task.state == GenerateState::thinking)
+            {
+                if(task.firstoutputthinkingtext)
+                    delta = trimLeadingWhitespace(delta);
+                if(!delta.empty())
+                {
+                    if(i == texts.size()-1 && !isStringEndsWithCompleteUTF8(delta))
+                        break;
+                    QString outputdelta = QString::fromStdString(delta);
+
+                    if(task.handle->outputtextcallback)
+                        task.handle->outputtextcallback(outputdelta,1);
+
+                    task.firstoutputthinkingtext = false;
+                    lastoutputpos += oristrlen;
+                }
+            }
+            else if(task.state == GenerateState::talking)
+            {
+                if(task.firstoutputtalkingtext)
+                    delta = trimLeadingWhitespace(delta);
+                if(!delta.empty())
+                {
+                    if(i == texts.size()-1 && !isStringEndsWithCompleteUTF8(delta))
+                        break;
+                    QString outputdelta = QString::fromStdString(delta);
+
+                    if(task.handle->outputtextcallback)
+                        task.handle->outputtextcallback(outputdelta,1);
+
+                    task.firstoutputtalkingtext = false;
+                    lastoutputpos += oristrlen;
+                }
+            }
+            else if(task.state == GenerateState::toolusing)
+            {
+                if(task.firstoutputtoolusingtext)
+                    delta = trimLeadingWhitespace(delta);
+                if(!delta.empty())
+                {
+                    if(i == texts.size()-1 && !isStringEndsWithCompleteUTF8(delta))
+                        break;
+                    QString outputdelta = QString::fromStdString(delta);
+
+                    if(task.handle->outputtextcallback)
+                        task.handle->outputtextcallback(outputdelta,1);
+
+                    task.firstoutputtalkingtext = false;
+                    lastoutputpos += oristrlen;
+                }
             }
         }
     };
 
-    int count = 3;
-    bool needthinking = true;
-    std::string prompt = buildPrompt(true,needthinking);
-    while(count-->0)
+    task.generatecount = 3;
+    while(task.generatecount-->0)
     {
-        // qDebug()<< QString::fromUtf8(prompt);
-        if(generate(prompt,output,outputchange))
+        if(generate(task,outputchange))
         {
             // 检查是否有工具调用
-            if (onusetool)
+            if (task.onusetool)
             {
-                if(containsToolCall(output))
+                // qDebug()<<QString::fromStdString(task.output);
+                std::string trimresponse = trimLeadingWhitespaceAndQuotes(task.output);
+                if(containsToolCall(trimresponse))
                 {
-                    llamaChatMsg newmsg("assistant",output);
-                    m_chathistory.emplace_back(newmsg);
-                    output.clear();
+                    llamaChatMsg newmsg("assistant",task.output);
+                    task.handle->m_chathistory.emplace_back(newmsg);
+                    task.output.clear();
                     lastoutputpos = 0;
-                    processToolCall(newmsg.content);
-                    if (count>1)
+
+                    trimresponse = stringreplace(trimresponse,"\\n","\n");
+                    processToolCall(task,trimresponse);
+                    // if (task.generatecount<=1)
+                    // {
+                    //     task.needthinking = false;
+                    //     // 更新prompt，加入工具的回复信息，最后一次输出取消思考，加入prompt确保有内容输出给用户
+                    //     task.extraprompt = "基于我的思考，我应该说:";
+                    // }
+                    // else
                     {
-                        // 更新prompt，加入工具的回复信息
-                        prompt = buildPrompt(true,needthinking);
-                    }
-                    else
-                    {
-                        // 更新prompt，加入工具的回复信息，最后一次输出取消思考，加入prompt确保有内容输出给用户
-                        prompt = buildPrompt(true,false);
-                        prompt+="基于我的思考，我应该说:";
+                        if(task.needthinking)
+                            task.extraprompt = "接下来我要查询刚刚的工具调用情况，然后执行下一步动作.";
+                        else
+                            task.extraprompt = "基于刚刚的工具调用情况，我应该说:";
                     }
                 }
-                onusetool =false;
+                task.onusetool = false;
             }
             else
             {
-                llamaChatMsg newmsg("assistant",output);
+                llamaChatMsg newmsg("assistant",task.output);
                 std::string trimresponse = trimLeadingWhitespaceAndQuotes(newmsg.extract_content_without_thinking());
-                m_chathistory.emplace_back(newmsg);
-                output.clear();
+                task.handle->m_chathistory.emplace_back(newmsg);
+                task.output.clear();
                 lastoutputpos = 0;
                 if(trimresponse!="")
                 {
                     QString outputtext = QString::fromStdString(trimresponse);
-                    qDebug()<<outputtext;
-                    emit outputText(outputtext, true);
+                    // qDebug()<<outputtext;
+                    if(task.handle->outputtextcallback)
+                        task.handle->outputtextcallback(outputtext,0);
+
                     return true;
                 }
-                else    // 没有输出实质内容
-                {
-                    // 取消思考，加入prompt确保有内容输出给用户
-                    prompt = buildPrompt(true,false);
-                    prompt+="基于我的思考，我应该说:";
-                }
+                // else    // 没有输出实质内容
+                // {
+                //     task.needthinking = false;
+                //     // 取消思考，加入prompt确保有内容输出给用户
+                //     task.extraprompt = "基于我的思考，我应该说:";
+                // }
             }
         }
         else
         {
-            return false;
+            if(task.taskstate != TaskState::Normal)
+            {
+                task.generatecount++;
+                task.handle->m_inputtask.enqueue(task);
+
+                if(task.taskstate!= TaskState::TokenClipPause)
+                {
+                    if(task.handle->outputtextcallback)
+                        task.handle->outputtextcallback("",2);
+                }
+            }
+            return true;
         }
-        state = GenerateState::talking;
+        task.state = GenerateState::talking;
     }
-    emit outputText("", true);
+    if(task.generatecount <= 0)
+    {
+        task.taskstate = TaskState::MaxGenCountPause;
+        task.handle->m_inputtask.enqueue(task);
+        task.handle->shouldpause = true;
+
+        if(task.handle->outputtextcallback)
+            task.handle->outputtextcallback("",2);
+
+        return true;
+    }
+
+    if(task.handle->outputtextcallback)
+        task.handle->outputtextcallback("",0);
+
     return false;
 }
 
-bool LlamaModel::preprocess(const std::string& prompt,llama_batch& batch)
+// 取出下一个将要处理的batch
+int LlamaModel::GetBatchToProcess(ClientHandle& handle, llama_batch& batch, int ori_batch_size)
 {
+    if(!m_ctx)
+        return -1;
 
-    // 1. 分词
-    std::vector<llama_token> tokens;
-    tokens.resize(prompt.size() + 3);
+    int newbatchlen = ori_batch_size;
 
-    int n_tokens = llama_tokenize(
-        m_vocab,
-        prompt.c_str(),
-        prompt.length(),
-        tokens.data(),
-        tokens.size(),
-        false,
-        true
-        );
+    uint32_t curtokenssize = handle.m_curtokens.size();
+    uint32_t newpos = min(handle.m_todecodepos + llama_n_batch(m_ctx) , curtokenssize);
 
-    if (n_tokens < 0) {
-        tokens.resize(-n_tokens);
-        n_tokens = llama_tokenize(
-            m_vocab,
-            prompt.c_str(),
-            prompt.length(),
-            tokens.data(),
-            tokens.size(),
-            false,
-            true
-            );
+    uint32_t batchlen = newpos - handle.m_todecodepos;
+    if(ori_batch_size < batchlen)
+    {
+        if(ori_batch_size>0)
+            llama_batch_free(batch);
+        batch = llama_batch_init(batchlen, 0, 1);
+        newbatchlen = batchlen;
     }
-
-    tokens.resize(n_tokens);
-
-    // 2. 批处理
-    batch = llama_batch_init(n_tokens, 0, 1);
+    else
+    {
+        batch.n_tokens = 0;
+    }
 
     if (batch.token == nullptr) {
         qDebug() << "Failed to initialize batch";
-        return false;
+        return -1;
     }
 
-    for (int i = 0; i < n_tokens; i++) {
-        batch.token[batch.n_tokens] = tokens[i];
-        batch.pos[batch.n_tokens] = i;
+    for (int index = handle.m_todecodepos; index < newpos; index++) {
+        batch.token[batch.n_tokens] = handle.m_curtokens[index];
+        batch.pos[batch.n_tokens] = index;
         batch.n_seq_id[batch.n_tokens] = 1;
-        batch.seq_id[batch.n_tokens][0] = default_seq_id;
-        batch.logits[batch.n_tokens] = (i == n_tokens - 1) ? 1 : 0;  // 最后一个输出logits
+        batch.seq_id[batch.n_tokens][0] = handle.seqid;
+        batch.logits[batch.n_tokens] = (index == curtokenssize - 1) ? 1 : 0;  // 最后一个输出logits
         batch.n_tokens++;
     }
 
+    return newbatchlen;
+}
+
+// 对新加入的任务做解析，将新的prompt进行token化，加入到要处理的m_curtokens中
+bool LlamaModel::preprocess(AITask& task)
+{
+    if(task.handle->m_curtokens.size() == 0)
+    {
+        // m_curtokens为空，直接重建prompt
+        if(task.taskstate == TaskState::ManualPause || task.taskstate == TaskState::MaxGenTokenPause || task.taskstate == TaskState::TokenClipPause)
+        {
+            std::string prompt = buildQwenPrompt(task.handle->m_chathistory,false,task.needthinking);
+            prompt += "<|im_start|>assistant\n";
+            prompt += task.output;
+            // qDebug()<< QString::fromStdString(prompt);
+            task.handle->m_curtokens = gettokenize(prompt,m_vocab);
+        }
+        else
+        {
+            std::string prompt = buildQwenPrompt(task.handle->m_chathistory,true,task.needthinking);
+            // qDebug()<< QString::fromStdString(prompt);
+            if(!task.toolsmsg.empty())
+                task.toolsmsg.clear();
+            if(!task.extraprompt.empty())
+            {
+                prompt += task.extraprompt;
+                task.extraprompt = "";
+            }
+            task.handle->m_curtokens = gettokenize(prompt,m_vocab);
+        }
+        tokenused += task.handle->m_curtokens.size();
+        return true;
+    }
+
+    // ctx存在时，判断ctx是否达到窗口大小，若达到需要重置
+    // 若ctx仍有冗余，则增量处理新的prompt
+
+    int n_ctx = llama_n_ctx(m_ctx);
+    int safety_margin = 500;
+    int window_size = n_ctx - 1000 - safety_margin;
+
+    auto getaddprmpt = [](AITask& task)->std::string
+    {
+        std::ostringstream oss;
+
+        for(auto& msg : task.toolsmsg)
+        {
+            if (msg.role == "user" || msg.role == "tool") {
+                oss << "<|im_start|>user\n";
+                oss << msg.content;
+                oss << "<|im_end|>\n";
+            }
+        }
+        task.toolsmsg.clear();
+
+        oss << "<|im_start|>assistant\n";
+        if (!task.needthinking) {
+            oss << "<think>\n\n</think>\n\n";
+        }
+        if(!task.extraprompt.empty())
+        {
+            if (!task.needthinking)
+                oss << task.extraprompt;
+            else
+            {
+                oss << "<think>\n" << task.extraprompt;
+                task.output += "<think>\n";
+            }
+            task.extraprompt = "";
+        }
+
+        return oss.str();
+    };
+
+    std::string addprompt = getaddprmpt(task);
+    std::vector<llama_token> addtokens = gettokenize(addprompt,m_vocab);
+    uint64_t newtokensused = addtokens.size() + tokenused;
+
+    if(newtokensused < window_size)    //新的token加入仍然不会使得ctx超过上下文限制，直接增量处理
+    {
+        task.handle->m_curtokens.insert(task.handle->m_curtokens.end(),addtokens.begin(),addtokens.end());
+        tokenused += addtokens.size();
+    }
+    else   //新的token加入导致ctx超过上下文限制，重置ctx，重建prompt
+    {
+        resetcontext();
+        const std::string prompt = buildQwenPrompt(task.handle->m_chathistory, true, task.needthinking);
+        task.handle->m_curtokens = gettokenize(prompt,m_vocab);
+        tokenused += task.handle->m_curtokens.size();
+    }
     return true;
 }
 
@@ -613,10 +830,10 @@ llama_sampler* LlamaModel::getsampler()
     llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     llama_sampler *sampler = llama_sampler_chain_init(sparams);
     {
-        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(20));
-        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(35));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9, 1));
         llama_sampler_chain_add(sampler, llama_sampler_init_penalties(80,1.2f,0.0f,0.0f));
-        llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.6));
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.75));
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(time(NULL)));
     }
     return sampler;
@@ -624,38 +841,134 @@ llama_sampler* LlamaModel::getsampler()
 
 void LlamaModel::resetcontext()
 {
+    for(auto it:m_handles)
+    {
+        auto handle = it.second;
+
+        llama_memory_t memeory = llama_get_memory(m_ctx);
+        llama_memory_seq_rm(memeory,handle->seqid,0,-1);
+
+        handle->m_curtokens.clear();
+        handle->m_todecodepos = 0;
+        if(handle->m_sampler)
+        {
+            llama_sampler_free(handle->m_sampler);
+            handle->m_sampler = nullptr;
+        }
+        handle->m_sampler = getsampler();
+    }
+
     if(m_ctx)
     {
         llama_free(m_ctx);
         m_ctx = nullptr;
     }
+
+    tokenused = 0;
+
+    llama_model* model = LlamaModelLoader::Instance()->Model();
+
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = 40960;
-    m_ctx = llama_init_from_model(m_model, cparams);
+    cparams.n_ctx = global_n_ctx;
+    cparams.n_seq_max = 4;
+
+    m_ctx = llama_init_from_model(model, cparams);
+    // qDebug()<<("resetctx 上下文长度: %d\n", llama_n_ctx((llama_context*)m_ctx));
 }
 
-bool LlamaModel::generate(const std::string& prompt, std::string& output, std::function<void()> outputchangecallback) {
+bool LlamaModel::generate(AITask& task, std::function<void()> outputchangecallback) {
     if (!m_loaded) return false;
 
-    resetcontext();
-
-    llama_batch batch;
-    if(!preprocess(prompt,batch))
+    if(task.taskstate == TaskState::Normal || task.taskstate == TaskState::MaxGenCountPause)
     {
-        qDebug()<<"llama preprocess error!";
-        return false;
+        if(!preprocess(task))
+        {
+            qDebug()<<"llama preprocess error!";
+            return false;
+        }
+        task.firstoutputthinkingtext = true;
+        task.firstoutputtalkingtext = true;
+    }
+    else
+    {
+        if(task.handle->m_curtokens.size()==0)
+        {
+            if(!preprocess(task))
+            {
+                qDebug()<<"llama preprocess error!";
+                return false;
+            }
+        }
+        if(task.taskstate == TaskState::ManualPause || task.taskstate == TaskState::MaxGenTokenPause)
+            task.current_gen = 0;
     }
 
-    // 3. 采样器
-    llama_sampler *sampler = getsampler();
-    // 4. 循环解码采样
-    bool result = true;
-    llama_token next_token = LLAMA_TOKEN_NULL;
-    int max_gen = 1000;  // 安全限制
-    int current_pos = 0;
+    if(task.taskstate != TaskState::Normal)
+        task.taskstate = TaskState::Normal;
 
-    for (int i = 0; i < max_gen; i++)
+
+    // qDebug() << "Starting generate with:";
+    // qDebug() << "  n_ctx =" << llama_n_ctx(m_ctx);
+    // qDebug() << "  n_batch =" << llama_n_batch(m_ctx);
+    // qDebug() << "  prompt length =" << task.prompt.length();
+
+    // 4. 循环解码采样
+    bool result = false;
+    static int max_gen = 800;  // 安全限制
+
+    llama_batch batch = llama_batch_init(llama_n_batch(m_ctx) , 0, 1);
+    if (batch.token == nullptr) {
+        qDebug() << "Failed to initialize batch";
+        return false;
+    }
+    int btachlen = llama_n_batch(m_ctx);
+
+    int last_check_loop_decode_count = 0;
+    int loop_decode_count = 0;
+
+    for (; task.current_gen < max_gen; task.current_gen++)
     {
+        if(task.handle->shouldpause)
+        {
+            result = false;
+            task.taskstate = TaskState::ManualPause;
+            break;
+        }
+
+        if(loop_decode_count > 0 && loop_decode_count - last_check_loop_decode_count >= task.handle->tokenclipsize)
+        {
+            last_check_loop_decode_count = loop_decode_count;
+
+            bool needpause = false;
+            for(auto it:m_handles)
+            {
+                auto handle = it.second;
+                if(handle == task.handle)
+                    continue;
+
+                //检查到有其他任务在等待，基于时间片原则让出
+                if(!handle->m_inputtask.empty() && !handle->shouldpause)
+                {
+                    needpause = true;
+                    break;
+                }
+            }
+
+            if(needpause)
+            {
+                result = false;
+                task.taskstate = TaskState::TokenClipPause;
+                break;
+            }
+        }
+
+        btachlen = GetBatchToProcess(*(task.handle),batch,btachlen);
+        if(btachlen <= 0)
+        {
+            result = false;
+            break;
+        }
+
         // 解码
         int decode_result = llama_decode(m_ctx, batch);
         if (decode_result != 0) {
@@ -664,46 +977,56 @@ bool LlamaModel::generate(const std::string& prompt, std::string& output, std::f
             break;
         }
 
-         // 采样
-        next_token = llama_sampler_sample(sampler, m_ctx, -1);
+        task.handle->m_todecodepos += batch.n_tokens;
+        loop_decode_count += batch.n_tokens;
 
-        if(shouldStopGeneration(next_token,output))
+        if(batch.logits[batch.n_tokens - 1] == 1)
         {
-            qDebug()<< "StoppingGeneration shouldend";
-            break;
+             // 采样
+            task.next_token = llama_sampler_sample(task.handle->m_sampler, m_ctx, -1);
+
+            bool shouldstop = shouldStopGeneration(task.next_token,task.output);
+
+            llama_sampler_accept(task.handle->m_sampler, task.next_token);
+
+            task.handle->m_curtokens.emplace_back(task.next_token);
+            tokenused++;
+
+            if(shouldstop)
+            {
+                qDebug()<< "StoppingGeneration shouldend";
+                result = true;
+                break;
+            }
+
+            // 反标记化
+            char deprompt[100] = {0};
+            if(llama_detokenize(m_vocab, &task.next_token, 1, deprompt, sizeof(deprompt), false, true) < 0){
+                qDebug()<<"Error: detokenize error";
+                result = false;
+                break;
+            }
+
+            task.output.append(deprompt);
+
+            if(outputchangecallback)
+                outputchangecallback();
         }
-
-        llama_sampler_accept(sampler, next_token);
-
-        // 反标记化
-        char deprompt[100] = {0};
-        if(llama_detokenize(m_vocab, &next_token, 1, deprompt, sizeof(deprompt), false, true) < 0){
-            qDebug()<<"Error: detokenize error";
-            result = false;
-            break;
-        }
-
-        output.append(deprompt);
-
-        if(outputchangecallback)
-            outputchangecallback();
-
-        current_pos+=batch.n_tokens;
-
-        // 重置batch用于下一个token（不清空内存，只重置计数器）
-        batch.n_tokens = 0;  // 重置，重用已分配的内存
-        // 添加新生成的token
-        batch.token[0] = next_token;
-        batch.pos[0] = current_pos;
-        batch.n_seq_id[0] = 1;
-        batch.seq_id[0][0] = default_seq_id;
-        batch.logits[0] = 1;  // 需要输出logits用于下一次采样
-        batch.n_tokens = 1;
-
     }
 
-    llama_sampler_free(sampler);
+    if(!result && task.current_gen >= max_gen)
+    {
+        task.handle->shouldpause = true;
+        task.taskstate = TaskState::MaxGenTokenPause;
+    }
+
     llama_batch_free(batch);
+
+    if (task.taskstate == TaskState::Normal || task.taskstate == TaskState::MaxGenCountPause)
+    {
+        task.next_token = LLAMA_TOKEN_NULL;
+        task.current_gen = 0;
+    }
 
     return result;
 }
@@ -721,15 +1044,83 @@ void LlamaModel::runasyncprocess()
         if (!m_loaded)
             break;
 
-        if(!m_inputtask.empty())
+        for(auto it:m_handles)
         {
-            std::string input;
-            if(m_inputtask.dequeue(input))
+            auto handle = it.second;
+            if(!handle->m_inputtask.empty() && !handle->shouldpause)
             {
-                processTask(input);
+                AITask task;
+                if(handle->m_inputtask.dequeue(task))
+                {
+                    processTask(task);
+                }
             }
         }
     }
+}
+
+LlamaClient *LlamaModel::CreateNewClient(ProcessPriority priority)
+{
+    static int seqid = 0;
+    const std::string &sessionid = generate_random_string_16();
+
+    ClientHandle* handle = new ClientHandle();
+    handle->sessionid = sessionid;
+    handle->m_sampler = getsampler();
+    handle->seqid = seqid;
+    handle->m_vocab = m_vocab;
+
+    if(priority == ProcessPriority::First)
+        handle->tokenclipsize = 50;
+    else if(priority == ProcessPriority::Second)
+        handle->tokenclipsize = 35;
+    else if(priority == ProcessPriority::Third)
+        handle->tokenclipsize = 20;
+    else if(priority == ProcessPriority::Last)
+        handle->tokenclipsize = 10;
+
+    seqid++;
+
+    std::ostringstream oss;
+    oss << system_template << "\n\n";
+    const std::vector<Tool>& tools = ToolExecutor::gettools();
+    if(!tools.empty())
+        oss << ToolExecutor::gettoolsprompt();
+
+    handle->m_chathistory.emplace_back(
+        "system",
+        oss.str());
+
+    m_handles[sessionid] = handle;
+
+    return new LlamaClient(sessionid);
+}
+
+void LlamaModel::CloseClient(std::string sessionid)
+{
+    auto it = m_handles.find(sessionid);
+    if(it == m_handles.end())
+        return;
+
+    auto handle = it->second;
+    m_handles.erase(it);
+
+    handle->shouldpause = true;
+
+    Sleep(100);
+
+    llama_memory_t memeory = llama_get_memory(m_ctx);
+    llama_memory_seq_rm(memeory,handle->seqid,0,-1);
+
+    tokenused = max(0 , tokenused - handle->m_curtokens.size());
+
+    if(handle->m_sampler)
+    {
+        llama_sampler_free(handle->m_sampler);
+        handle->m_sampler = nullptr;
+    }
+
+    delete handle;
 }
 
 LlamaModel::~LlamaModel() {
@@ -737,34 +1128,202 @@ LlamaModel::~LlamaModel() {
         llama_free((llama_context*)m_ctx);
         m_ctx = nullptr;
     }
-    if (m_model) {
-        llama_model_free((llama_model*)m_model);
-        m_model = nullptr;
+    for(auto it :m_handles)
+    {
+        auto handle = it.second;
+        if(handle->m_sampler)
+        {
+            llama_sampler_free(handle->m_sampler);
+            handle->m_sampler = nullptr;
+        }
     }
-    llama_backend_free();
+    if (!m_vocab) {
+        m_vocab = nullptr;
+    }
+}
+
+LlamaModel::LlamaModel()
+{
+    tokenused = 0;
 }
 
 bool LlamaModel::isLoaded() const { return m_loaded; }
 
-void LlamaModel::inputText(QString text)
+void LlamaModel::inputText(std::string sessionid, QString text, bool thinkingEnabled)
 {
     if(!m_loaded)
         return;
 
-    std::string stdtext = text.toStdString();
-    m_inputtask.enqueue(stdtext);
+    auto it = m_handles.find(sessionid);
+    if(it == m_handles.end())
+        return;
+
+    auto handle = it->second;
+
+    if (!handle->m_inputtask.empty())
+        handle->ClearPausedTask();
+
+    AITask task;
+    task.userinput = text.toStdString();
+    task.toolsmsg.emplace_back("user",text.toStdString());
+    task.needthinking = thinkingEnabled;
+    task.sessionid = sessionid;
+    task.handle = handle;
+    handle->m_inputtask.enqueue(task);
+
+    handle->shouldpause = false;
     m_queprocesscv.notify_one();
 }
 
-std::string LlamaModel::buildPrompt(bool add_generation_prompt,bool enable_thinking) {
-    return buildQwenPrompt(m_chathistory, ToolExecutor::gettools(), add_generation_prompt, enable_thinking);
+std::string LlamaModel::buildQwenPrompt(std::vector<llamaChatMsg>& messages, bool add_generation_prompt,bool enable_thinking) {
+    // 构建Qwen ChatML格式的prompt
+
+    if(messages.empty())
+        return "";
+
+    std::ostringstream oss;
+
+    auto buildtokens = [&]
+        (const std::string& prompt,std::vector<llama_token>& tokens,int& tokensize)
+        -> void
+    {
+        if(!m_vocab)
+            return;
+
+        tokens.resize(prompt.size() + 3);
+
+        int n_tokens = llama_tokenize(
+            m_vocab,
+            prompt.c_str(),
+            prompt.length(),
+            tokens.data(),
+            tokens.size(),
+            false,
+            true
+            );
+
+        if (n_tokens < 0) {
+            tokens.resize(-n_tokens);
+            n_tokens = llama_tokenize(
+                m_vocab,
+                prompt.c_str(),
+                prompt.length(),
+                tokens.data(),
+                tokens.size(),
+                false,
+                true
+                );
+        }
+
+        if(tokens.size() != n_tokens)
+            tokens.resize(n_tokens);
+
+        tokensize = n_tokens;
+    };
+
+    for (auto &msg : messages)
+    {
+        if(msg.tokensize == -1)
+        {
+            std::string prompt = "<|im_start|>";
+            if(msg.role == "system")
+            {
+                prompt += "system\n";
+                prompt += msg.content;
+            }
+            else if(msg.role == "user" || msg.role == "tool")
+            {
+                prompt += "user\n";
+                prompt += msg.content;
+            }
+            else if(msg.role == "assistant")
+            {
+                prompt += "assistant\n";
+                if(!msg.usetool)
+                    prompt += msg.extract_content_without_thinking();
+                else
+                    prompt += msg.content;
+            }
+            prompt += "<|im_end|>\n";
+            buildtokens(prompt,msg.tokens,msg.tokensize);
+        }
+    }
+
+    int n_ctx = llama_n_ctx(m_ctx);          // 模型总容量
+    int safety_margin = 500;
+    int window_size = min(n_ctx / 2, n_ctx - 1000 - safety_margin);  // 滑动窗口大小（记忆量）
+
+    if(window_size < 0)
+        return "";
+
+    int curtokensize = 0;
+
+    // 1. 如果有系统消息，先添加
+    if (messages[0].role == "system") {
+        oss << "<|im_start|>system\n" << messages[0].content << "<|im_end|>\n";
+        curtokensize += messages[0].tokensize;
+    }
+
+    // 2. 在模型可容纳的范围内加入历史消息
+    int startIndex = 0;
+    for (int i = messages.size() - 1; i >= 0; i--) {
+        if(i == 0 && messages[i].role == "system")
+            break;
+
+        const auto& msg = messages[i];
+        if(curtokensize + msg.tokensize > window_size)
+        {
+            startIndex = i + 1;
+            break;  //达到滑动窗口大小，舍弃前面的记忆
+        }
+        curtokensize += msg.tokensize;
+    }
+
+    for (int i = startIndex; i < messages.size(); i++) {
+        if(i == 0 && messages[i].role == "system")
+            continue;
+
+        const auto& msg = messages[i];
+        if (msg.role == "user") {
+            // 用户消息
+            oss << "<|im_start|>user\n";
+            oss << msg.content;
+            oss << "<|im_end|>\n";
+        } else if (msg.role == "assistant") {
+            // 助手消息
+            oss << "<|im_start|>assistant\n";
+            if(!msg.usetool)
+                oss << msg.extract_content_without_thinking();
+            else
+                oss << msg.content;
+            oss << "<|im_end|>\n";
+        } else if (msg.role == "tool") {
+            if(msg.out_time < GetTimestampMilliseconds())
+                continue;
+            oss << "<|im_start|>user\n";
+            oss << msg.content;
+            oss << "<|im_end|>\n";
+        }
+    }
+
+
+    // 3. 添加生成提示
+    if (add_generation_prompt) {
+        oss << "<|im_start|>assistant\n";
+        if (!enable_thinking) {
+            oss << "<think>\n\n</think>\n\n";
+        }
+    }
+
+    return oss.str();
 }
 
 llamaChatMsg::llamaChatMsg(std::string role,
                            std::string content,
                            std::string reasoning_content,
-                           int64_t out_time)
-    :role(role),content(content),reasoning_content(reasoning_content),out_time(out_time){}
+                           int64_t out_time,
+                           bool usetool)
+    :role(role),content(content),reasoning_content(reasoning_content),out_time(out_time),usetool(usetool),tokensize(-1),usethinking(false){}
 
 bool llamaChatMsg::has_think_tags() const{
     return content.find("<think>") != std::string::npos &&
@@ -786,18 +1345,205 @@ std::string llamaChatMsg::extract_content_without_thinking() const{
     return content.substr(end);
 }
 
-void LlamaModel::processToolCall(const std::string &string)
+void LlamaModel::processToolCall(AITask& task, const std::string &string)
 {
     // 解析工具调用
-    ToolCall tool_call = parseToolCall(string);
-    // 执行工具
-    ToolResult tool_result = ToolExecutor::execute(tool_call);
-    // 添加到输出
-    std::string tool_response = formatToolResponse(tool_result.result_str);
+    std::vector<ToolCall> tool_calls = parseToolCall(string);
 
-    int64_t out_time = GetTimestampMilliseconds() + ((int64_t)tool_result.ttl_second) * 1000;
+    auto gettoolsoutput = [](std::vector<std::string> results)-> std::string
+    {
+        std::string str = "\n\n-----------toolcall result-----------\n";
+        for(auto &result :results)
+        {
+            str += result;
+            str += "\n";
+        }
+        str+= "---------toolcall result over---------\n";
+        return str;
+    };
 
-    qDebug()<<"toolcall:" << QString::fromUtf8(tool_call.to_json()) <<"\nresponse"<<QString::fromUtf8(tool_result.result_str);
+    std::vector<std::string> results;
+    for(auto &tool_call:tool_calls)
+    {
+        ToolResult tool_result = ToolExecutor::execute(tool_call);
+        results.emplace_back(tool_result.result_str);
+        std::string tool_response = formatToolResponse(tool_result.result_str);
+        int64_t out_time = GetTimestampMilliseconds() + ((int64_t)tool_result.ttl_second) * 1000;
+        qDebug()<<"toolcall:" << QString::fromUtf8(tool_call.to_json()) <<"\nresponse"<<QString::fromUtf8(tool_result.result_str);
+        task.handle->m_chathistory.emplace_back("tool", tool_response, "", out_time, true);
+        task.toolsmsg.emplace_back("tool", tool_response, "", out_time, true);
+    }
+    if(!results.empty())
+        task.output += gettoolsoutput(results);
+}
 
-    m_chathistory.emplace_back("tool",tool_response,"",out_time);
+void LlamaModel::pauseGenerate(std::string sessionid)
+{
+    if(m_handles.find(sessionid) == m_handles.end())
+        return;
+
+    ClientHandle* handle = m_handles[sessionid];
+    handle->shouldpause = true;
+}
+
+void LlamaModel::continueGenerate(std::string sessionid)
+{
+    if(m_handles.find(sessionid) == m_handles.end())
+        return;
+
+    ClientHandle* handle = m_handles[sessionid];
+    handle->shouldpause = false;
+    m_queprocesscv.notify_one();
+}
+
+// 清除掉最后一次用户输入以后的历史记录，然后继续生成
+void LlamaModel::reGenerate(std::string sessionid, bool thinkingEnabled)
+{
+    if(m_handles.find(sessionid) == m_handles.end())
+        return;
+
+    ClientHandle* handle = m_handles[sessionid];
+
+    llama_memory_t memeory = llama_get_memory(m_ctx);
+    llama_memory_seq_rm(memeory,handle->seqid,0,-1);
+
+    tokenused = max(0 , tokenused - handle->m_curtokens.size());
+
+    handle->m_curtokens.clear();
+    handle->m_todecodepos = 0;
+    if(handle->m_sampler)
+    {
+        llama_sampler_free(handle->m_sampler);
+        handle->m_sampler = nullptr;
+    }
+    handle->m_sampler = getsampler();
+
+    if(!handle->m_inputtask.empty())
+        handle->ClearPausedTask();
+
+    std::string user_input_text;
+    bool thinking = false;
+    for(int i = handle->m_chathistory.size() - 1; i >= 0; i--)
+    {
+        if(i == 0)
+            break;
+        if(handle->m_chathistory[i].role != "user"){
+            handle->m_chathistory.pop_back();
+        }
+        else
+        {
+            user_input_text = handle->m_chathistory[i].content;
+            thinking = thinkingEnabled;
+            handle->m_chathistory.pop_back();
+            break;
+        }
+    }
+
+    AITask task;
+    task.userinput = user_input_text;
+    task.toolsmsg.emplace_back("user",user_input_text);
+    task.needthinking = thinking;
+    task.handle = handle;
+    handle->m_inputtask.enqueue(task);
+    handle->shouldpause = false;
+    m_queprocesscv.notify_one();
+}
+
+void LlamaModel::clearHistory(std::string sessionid)
+{
+    if(m_handles.find(sessionid) == m_handles.end())
+        return;
+
+    ClientHandle* handle = m_handles[sessionid];
+
+    llama_memory_t memeory = llama_get_memory(m_ctx);
+    llama_memory_seq_rm(memeory,handle->seqid,0,-1);
+
+    tokenused = max(0 , tokenused - handle->m_curtokens.size());
+
+    handle->m_curtokens.clear();
+    handle->m_todecodepos = 0;
+    if(handle->m_sampler)
+    {
+        llama_sampler_free(handle->m_sampler);
+        handle->m_sampler = nullptr;
+    }
+    handle->m_sampler = getsampler();
+
+    handle->m_chathistory.clear();
+    handle->m_inputtask.clear();
+    handle->shouldpause = false;
+
+    std::ostringstream oss;
+    oss << system_template << "\n\n";
+    const std::vector<Tool>& tools = ToolExecutor::gettools();
+    if(!tools.empty())
+        oss << ToolExecutor::gettoolsprompt();
+
+    handle->m_chathistory.emplace_back(
+        "system",
+        oss.str());
+}
+
+void LlamaModel::bindOutPutTextCallback(const std::string &sessionid,std::function<void (QString, int)> callback)
+{
+    if(m_handles.find(sessionid) == m_handles.end())
+        return;
+
+    ClientHandle* handle = m_handles[sessionid];
+    handle->outputtextcallback = callback;
+}
+
+bool LlamaModelLoader::load(const std::string &model_path)
+{
+    // 1. 检查文件是否存在
+    FILE* test = fopen(model_path.c_str(), "rb");
+    if (!test) {
+        qDebug()<<("错误: 找不到模型文件: %s\n", model_path.c_str());
+        return false;
+    }
+    fclose(test);
+
+    qDebug()<<("正在加载模型: %s\n", model_path.c_str());
+
+    // 2. 使用默认参数
+    llama_model_params mparams = llama_model_default_params();
+
+    // 3. 加载模型
+    m_model = llama_model_load_from_file(model_path.c_str(), mparams);
+    if (!m_model) {
+        qDebug()<<("错误: 模型加载失败\n");
+        return false;
+    }
+
+    return true;
+}
+
+bool LlamaModelLoader::isLoaded()
+{
+    return m_model != nullptr;
+}
+
+llama_model *LlamaModelLoader::Model()
+{
+    return m_model;
+}
+
+LlamaModelLoader::~LlamaModelLoader()
+{
+    if (m_model) {
+        llama_model_free((llama_model*)m_model);
+        m_model = nullptr;
+    }
+    llama_backend_free();
+}
+
+LlamaModelLoader *LlamaModelLoader::Instance()
+{
+    static LlamaModelLoader* m_instance = new LlamaModelLoader();
+    return m_instance;
+}
+
+LlamaModelLoader::LlamaModelLoader()
+{
 }

@@ -4,6 +4,7 @@
 #include <QUuid>
 #include <QTimer>
 #include "NetWorkHelper.h"
+#include <QCoreApplication>
 
 const QString default_downloaddir = "chat_download/";
 ;
@@ -139,16 +140,21 @@ void FileTransManager::AckTaskRes(const json& js)
 			else
 			{
 				re->trycount++;
-				if (re->trycount < 5)
+                if (re->trycount < 3)
 				{
 					QTimer* timer = new QTimer();
-					timer->setSingleShot(true);
+                    timer->setSingleShot(true);
 					// 连接定时器的 timeout 信号到槽函数
 					QObject::connect(timer, &QTimer::timeout, [this, fileid]() {
+                        CHATITEMMODEL->fileTransProgressChange(fileid,0);
 						this->ReqDownloadFile(fileid);
 						});
-					timer->start(3000);
+                    timer->start(1500);
 				}
+                else
+                {
+                    CHATITEMMODEL->fileTransError(fileid);
+                }
 			}
 		}
 	}
@@ -229,7 +235,7 @@ void FileTransManager::ReqUploadFile(const QString& fileid)
 	js["fileid"] = fileid.toStdString();
 	js["taskid"] = QUuid::createUuid().toString().toStdString();
 	js["type"] = 1;
-	js["token"] = USERINFOMODEL->usertoken().toStdString();
+    js["jwt"] = USERINFOMODEL->userjwt().toStdString();
 
 	NetWorkHelper::SendMessagePackage(&js);
 }
@@ -241,7 +247,7 @@ void FileTransManager::ReqDownloadFile(const QString& fileid)
 	js["fileid"] = fileid.toStdString();
 	js["taskid"] = QUuid::createUuid().toString().toStdString();
 	js["type"] = 2;
-	js["token"] = USERINFOMODEL->usertoken().toStdString();
+    js["jwt"] = USERINFOMODEL->userjwt().toStdString();
 
 	NetWorkHelper::SendMessagePackage(&js);
 }
@@ -259,20 +265,20 @@ void FileTransManager::InterruptTask(const QString& fileid)
 
 QString FileTransManager::DownloadDir()
 {
-	return default_downloaddir;
+    QString appDirPath = QCoreApplication::applicationDirPath();
+    return appDirPath + "/" + default_downloaddir + USERINFOMODEL->usertoken() + "/" ;
 }
 
 QString FileTransManager::FindDownloadPathByFileId(const QString &fileid)
 {
     QString result = "";
-    m_tasks.EnsureCall(
-        [&](std::map<QString, FileTransTaskContent*>& map) ->void {
+    m_reqrecords.EnsureCall(
+        [&](std::map<QString, FileReqRecord*>& map) ->void {
             for (auto& task : map)
             {
-                if (task.second->fileid == fileid)
+                if (task.second->fileid == fileid && task.second->status == transstatus::done)
                 {
-                    FileTransTaskContent* content = task.second;
-                    result = content->task->FilePath();
+                    result = task.second->filepath;
                     return;
                 }
             }
@@ -363,7 +369,7 @@ void FileTransManager::OnDownloadFinish(FileTransferDownLoadTask* task)
 
 	updateReqRecordStatus(content->fileid, transstatus::done);
 	CHATITEMMODEL->fileTransFinished(content->fileid);
-	DeleteTask(taskid);
+    DeleteTask(taskid);
 }
 
 void FileTransManager::OnDownloadError(FileTransferDownLoadTask* task)

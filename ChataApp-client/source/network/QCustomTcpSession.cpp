@@ -20,6 +20,7 @@ struct CustomTcpMsgHeader
     uint32_t magic = CustomProtocolMagic;
     int seq = 0;
     int ack = -1;
+    uint8_t msgType = 0; // 0:null, 1:请求, 2:响应
     int length = 0;
     uint32_t checksum = 0xFFFFFFFF;
 
@@ -27,6 +28,8 @@ struct CustomTcpMsgHeader
     CustomTcpMsgHeader(int seq, int ack, int length)
         : seq(seq), ack(ack), length(length)
     {
+        if (ack != -1)
+            msgType = 2;
     }
 };
 
@@ -79,12 +82,12 @@ AnalysisResult AnalysisDataPackage(Buffer *buf, CustomPackage *outPak)
         return AnalysisResult::InputError;
     }
 
-    if (buf->Remaind() < sizeof(CustomTcpMsgHeader))
+    if (buf->Remain() < sizeof(CustomTcpMsgHeader))
     {
         return AnalysisResult::BufferAGAIN;
     }
 
-    int oriPos = buf->Postion();
+    int oriPos = buf->Position();
 
     CustomTcpMsgHeader header;
     buf->Read(&header, sizeof(CustomTcpMsgHeader));
@@ -92,20 +95,21 @@ AnalysisResult AnalysisDataPackage(Buffer *buf, CustomPackage *outPak)
     if (header.magic != CustomProtocolMagic)
         return AnalysisResult::MagicError;
 
-    if (buf->Remaind() < header.length)
+    if (buf->Remain() < header.length)
     {
         buf->Seek(oriPos);
         return AnalysisResult::BufferAGAIN;
     }
 
-    if (!CheckPakHeader(header, (uint8_t *)(buf->Byte() + buf->Postion()), header.length))
+    if (!CheckPakHeader(header, (uint8_t *)(buf->Byte() + buf->Position()), header.length))
     {
-        buf->Shift(buf->Postion() + header.length);
+        buf->Shift(buf->Position() + header.length);
         return AnalysisResult::ChecksumError;
     }
 
     outPak->seq = header.seq;
     outPak->ack = header.ack;
+    outPak->msgType = header.msgType;
     outPak->buffer.Append(*buf, header.length);
 
     return AnalysisResult::Success;
@@ -134,6 +138,8 @@ bool CustomTcpSession::Connect(const QString &IP, quint16 Port)
 
 bool CustomTcpSession::Release()
 {
+    _callbackRecvRequest = nullptr;
+
     bool result = Base::Release();
 
     CustomPackage *pak = nullptr;
@@ -189,7 +195,9 @@ bool CustomTcpSession::AwaitSend(const Buffer &buffer, Buffer &response)
             return false;
 
         Buffer buf(buffer);
-        AddPakHeader(&buf, CustomTcpMsgHeader(seq, -1, buffer.Length()));
+        CustomTcpMsgHeader header(seq, -1, buffer.Length());
+        header.msgType = 1;
+        AddPakHeader(&buf, header);
         if (BaseClient->Send(buf)) // 发送
         {
             std::unique_lock<std::mutex> awaitlck(task->_mtx);
@@ -233,17 +241,17 @@ bool CustomTcpSession::OnRecvData(Buffer *buffer)
             return false;
     }
 
-    if (buffer->Remaind() > 0)
+    if (buffer->Remain() > 0)
         cacheBuffer.Append(*buffer);
 
-    while (cacheBuffer.Remaind() > 0)
+    while (cacheBuffer.Remain() > 0)
     {
         // 解析数据包
         AnalysisResult result = AnalysisDataPackage(&cacheBuffer, cachePak);
         if (result == AnalysisResult::Success)
         {
             // 数据包解析成功，获得完整Package
-            cacheBuffer.Shift(cacheBuffer.Postion());
+            cacheBuffer.Shift(cacheBuffer.Position());
 
             cachePak->buffer.Seek(0);
             CustomPackage *newPak = cachePak;
@@ -291,13 +299,26 @@ void CustomTcpSession::ProcessPakage(CustomPackage *newPak)
 
     if (newPak)
     {
-        if (newPak->ack != -1)
+        if (_RecvPaks.size() > 300)
+        {
+            CustomPackage *pak = nullptr;
+            if (_RecvPaks.dequeue(pak))
+                SAFE_DELETE(pak);
+        }
+        _RecvPaks.enqueue(newPak);
+    }
+
+    int count = 10;
+    CustomPackage *pak = nullptr;
+    while (_RecvPaks.front(pak) && count > 0)
+    {
+        if (pak->ack != -1)
         {
             AwaitTask *task = nullptr;
-            if (_AwaitMap.Find(newPak->ack, task))
+            if (_AwaitMap.Find(pak->ack, task))
             {
                 if (task->respsonse)
-                    task->respsonse->CopyFromBuf(newPak->buffer);
+                    task->respsonse->CopyFromBuf(pak->buffer);
 
                 int count = 0;
                 while (!(task->status == -1) && count < 5)
@@ -306,36 +327,48 @@ void CustomTcpSession::ProcessPakage(CustomPackage *newPak)
                     Sleep(10);
                 }
                 Sleep(5);
-                // printf("notify_all , pak->ack:%d\n", pak->ack);
                 task->_cv.notify_all();
             }
-            SAFE_DELETE(newPak);
+            _RecvPaks.dequeue(pak);
+            SAFE_DELETE(pak);
         }
         else
         {
-            if (_RecvPaks.size() > 300)
-            {
-                CustomPackage *pak = nullptr;
-                if (_RecvPaks.dequeue(pak))
-                    SAFE_DELETE(pak);
-            }
-            _RecvPaks.enqueue(newPak);
-        }
-    }
 
-    int count = 10;
-    CustomPackage *pak = nullptr;
-    while (_RecvPaks.front(pak) && count > 0)
-    {
-        if (_callbackRecvData)
-        {
-            Buffer resposne;
-            _callbackRecvData(this, &pak->buffer, &resposne);
-            if (resposne.Length() > 0)
-                Send(resposne, pak->seq);
-            resposne.Release();
-            _RecvPaks.dequeue(pak);
-            SAFE_DELETE(pak);
+            if (pak->msgType == 1)
+            {
+                if (_callbackRecvRequest)
+                {
+                    Buffer resposne;
+                    try
+                    {
+                        _callbackRecvRequest(this, &pak->buffer, &resposne);
+                    }
+                    catch (...)
+                    {
+                    }
+                    if (resposne.Length() > 0)
+                        Send(resposne, pak->seq);
+                    resposne.Release();
+                    _RecvPaks.dequeue(pak);
+                    SAFE_DELETE(pak);
+                }
+            }
+            else
+            {
+                if (_callbackRecvData)
+                {
+                    try
+                    {
+                        _callbackRecvData(this, &pak->buffer);
+                    }
+                    catch (...)
+                    {
+                    }
+                    _RecvPaks.dequeue(pak);
+                    SAFE_DELETE(pak);
+                }
+            }
         }
         count--;
     }
@@ -453,4 +486,27 @@ CheckHandshakeStatus CustomTcpSession::CheckHandshakeConfirmMsg(Buffer &buffer)
 TCPClient *CustomTcpSession::GetBaseClient()
 {
     return BaseClient;
+}
+
+void CustomTcpSession::BindRecvRequestCallBack(std::function<void(BaseNetWorkSession *, Buffer *recv, Buffer *resp)> callback)
+{
+    _callbackRecvRequest = callback;
+    OnBindRecvRequestCallBack();
+}
+
+void CustomTcpSession::OnBindRecvRequestCallBack()
+{
+    if (_ProcessLock.trylock())
+    {
+        try
+        {
+            ProcessPakage();
+        }
+        catch (const std::exception &e)
+        {
+            _ProcessLock.unlock();
+            std::cerr << e.what() << '\n';
+        }
+        _ProcessLock.unlock();
+    }
 }

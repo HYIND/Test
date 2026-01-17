@@ -15,10 +15,10 @@ int main(int argc, char *argv[])
 
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
 
-    LLAMAMODEL->load("./chatmodel.gguf");
-    if(LLAMAMODEL->isLoaded())
+    LlamaModel::Instance()->load("./chatmodel.gguf");
+    if(LlamaModel::Instance()->isLoaded())
     {
-        std::thread T(&LlamaModel::runasyncprocess,LLAMAMODEL);
+        std::thread T(&LlamaModel::runasyncprocess,LlamaModel::Instance());
         T.detach();
     }
 
@@ -43,7 +43,9 @@ int main(int argc, char *argv[])
     engine.rootContext()->setContextProperty("sessionmodel", SESSIONMODEL);
     engine.rootContext()->setContextProperty("userinfomodel", USERINFOMODEL);
     engine.rootContext()->setContextProperty("loginmodel", LOGINMODEL);
-    engine.rootContext()->setContextProperty("llamamodel", LLAMAMODEL);
+    engine.rootContext()->setContextProperty("aiassistantmodel", AIASSISTANTMODEL);
+    engine.rootContext()->setContextProperty("aisummarymodel", AISUMMARYMODEL);
+    engine.rootContext()->setContextProperty("ocrmodel", OCRMODEL);
     engine.load(url);
 
     // 创建局部事件循环和超时控制器等待子线程完成初始化
@@ -69,7 +71,7 @@ int main(int argc, char *argv[])
     // 进入局部事件循环（非阻塞式等待）
     localLoop.exec();
 
-    CONNECTMANAGER->Login("192.168.58.128",8888);
+    CONNECTMANAGER->Login("192.168.58.130",8888);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 

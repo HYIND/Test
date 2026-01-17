@@ -2,12 +2,23 @@
 #include "FileRecordStore.h"
 #include "LoginUserManager.h"
 #include "NetWorkHelper.h"
+#include "Timer.h"
+
+constexpr int64_t taskexpiredseconds = 1800;
+
+int64_t GetTimestampSeconds()
+{
+    auto now = std::chrono::system_clock::now();
+    auto duration = now.time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+}
 
 FileTransTaskContent::FileTransTaskContent(const string &id, FileTransferTask *t, BaseNetWorkSession *s)
 {
     fileid = id;
     task = t;
     session = s;
+    timestamp = GetTimestampSeconds();
 }
 
 FileTransTaskContent::~FileTransTaskContent()
@@ -17,7 +28,22 @@ FileTransTaskContent::~FileTransTaskContent()
 }
 
 FileTransManager::FileTransManager()
+    : HandleLoginUser(nullptr)
 {
+    CleanExpiredTask = TimerTask::CreateRepeat("FileTransManager::CleanExpiredFileTransTimer",
+                                               30 * 1000,
+                                               std::bind(&FileTransManager::CleanExpireTask, this),
+                                               30 * 1000);
+    CleanExpiredTask->Run();
+}
+
+FileTransManager::~FileTransManager()
+{
+    if (CleanExpiredTask)
+    {
+        CleanExpiredTask->Clean();
+        CleanExpiredTask = nullptr;
+    }
 }
 
 FileTransManager *FileTransManager::Instance()
@@ -26,7 +52,7 @@ FileTransManager *FileTransManager::Instance()
     return instance;
 }
 
-bool FileTransManager::ProcessMsg(BaseNetWorkSession *session, const string &ip, const uint16_t port, const json &js, Buffer &buf)
+bool FileTransManager::ProcessMsg(BaseNetWorkSession *session, const json &js, Buffer &buf)
 {
     int command = js.at("command");
     switch (command)
@@ -48,6 +74,8 @@ bool FileTransManager::DistributeMsg(BaseNetWorkSession *session, const json &js
         return false;
 
     string taskid = js["taskid"];
+    UpdateTimeStamp(taskid);
+
     FileTransTaskContent *content = nullptr;
     if (!m_tasks.Find(taskid, content))
         return false;
@@ -65,14 +93,15 @@ void FileTransManager::AckTaskReq(BaseNetWorkSession *session, const json &js)
         return;
     if (!js.contains("type") || !js.at("type").is_number_unsigned())
         return;
-    if (!js.contains("token") || !js.at("token").is_string())
+    if (!js.contains("jwt") || !js.at("jwt").is_string())
         return;
 
-    string token = js["token"];
+    string jwtstr = js["jwt"];
     string fileid = js["fileid"];
     string taskid = js["taskid"];
     uint32_t type = js["type"];
-    if (!HandleLoginUser->Verfiy(session, token))
+    string token;
+    if (!HandleLoginUser->Verfiy(session, jwtstr, token))
     {
         return;
     }
@@ -92,6 +121,7 @@ void FileTransManager::AckTaskReq(BaseNetWorkSession *session, const json &js)
         {
             if (record.status != FileStoreStatus::COMPLETED)
             {
+                FILERECORDSTORE->updateFileRecordStatus(fileid, FileStoreStatus::UPLOADING);
                 AddDownloadTask(fileid, taskid, record.path, record.filesize, session);
             }
         }
@@ -104,6 +134,7 @@ void FileTransManager::AckTaskReq(BaseNetWorkSession *session, const json &js)
         js_reply["taskid"] = taskid;
     }
 
+    // 先发送5001，然后启动Upload
     NetWorkHelper::SendMessagePackage(session, &js_reply);
 
     if (type == 2)
@@ -166,11 +197,52 @@ bool FileTransManager::AddDownloadTask(const string &fileid, const string &taski
 void FileTransManager::DeleteTask(const string &taskid)
 {
     FileTransTaskContent *content = nullptr;
+    auto guard = m_tasks.MakeLockGuard();
     if (!m_tasks.Find(taskid, content))
         return;
 
     m_tasks.Erase(taskid);
     SAFE_DELETE(content);
+}
+
+void FileTransManager::CleanExpireTask()
+{
+    int64_t currentTime = GetTimestampSeconds();
+    int64_t expiredTime = currentTime - taskexpiredseconds;
+
+    {
+        auto guard = m_tasks.MakeLockGuard();
+        std::map<std::string, FileTransTaskContent *> interruptTasks;
+        m_tasks.EnsureCall([&](std::map<std::string, FileTransTaskContent *> &map) -> void
+                           {
+                        for(auto pair:map){
+                            FileTransTaskContent * content = pair.second;
+                            if(!content||!content->task)
+                            {
+                                interruptTasks[pair.first]= pair.second;
+                                continue;
+                            }
+                            if(content->timestamp<expiredTime)
+                            {
+                                interruptTasks[pair.first]= pair.second;
+                            }
+                        } 
+                        for(auto &pair:interruptTasks)
+                        {
+                            FileTransTaskContent * content = pair.second;
+                            content->task->InterruptTrans(content->session);
+                        } });
+    }
+}
+
+void FileTransManager::UpdateTimeStamp(const string &taskid)
+{
+    FileTransTaskContent *content = nullptr;
+    auto guard = m_tasks.MakeLockGuard();
+    if (!m_tasks.Find(taskid, content))
+        return;
+    if (content)
+        content->timestamp = GetTimestampSeconds();
 }
 
 void FileTransManager::OnUploadFinish(FileTransferUploadTask *task)
@@ -182,12 +254,24 @@ void FileTransManager::OnUploadFinish(FileTransferUploadTask *task)
 void FileTransManager::OnUploadError(FileTransferUploadTask *task)
 {
     string taskid = task->TaskId();
+    {
+        FileTransTaskContent *content = nullptr;
+        auto guard = m_tasks.MakeLockGuard();
+        if (!m_tasks.Find(taskid, content) && content)
+            FILERECORDSTORE->updateFileRecordStatus(content->fileid, FileStoreStatus::SUSPEND);
+    }
     DeleteTask(taskid);
 }
 
 void FileTransManager::OnUploadInterrupt(FileTransferUploadTask *task)
 {
     string taskid = task->TaskId();
+    {
+        FileTransTaskContent *content = nullptr;
+        auto guard = m_tasks.MakeLockGuard();
+        if (!m_tasks.Find(taskid, content) && content)
+            FILERECORDSTORE->updateFileRecordStatus(content->fileid, FileStoreStatus::SUSPEND);
+    }
     DeleteTask(taskid);
 }
 
@@ -224,4 +308,28 @@ void FileTransManager::OnDownloadProgress(FileTransferDownLoadTask *task, uint32
 void FileTransManager::SetLoginUserManager(LoginUserManager *m)
 {
     HandleLoginUser = m;
+}
+
+void FileTransManager::SessionClose(BaseNetWorkSession *session)
+{
+    auto guard = m_tasks.MakeLockGuard();
+    std::map<std::string, FileTransTaskContent *> closeTasks;
+    m_tasks.EnsureCall([&](std::map<std::string, FileTransTaskContent *> &map) -> void
+                       {
+                        for(auto pair:map){
+                            FileTransTaskContent * content = pair.second;
+                            if(!content||!content->task)
+                            {
+                                closeTasks[pair.first]= pair.second;
+                                continue;
+                            }
+                            if(content->session == session)
+                            {
+                                closeTasks[pair.first]= pair.second;
+                            }
+                        } 
+                        for(auto &pair : closeTasks)
+                        {
+                            DeleteTask(pair.first);
+                        } });
 }
