@@ -1,0 +1,261 @@
+﻿#pragma once
+
+#include "vkstdafx.h"
+#include "../Base/Texture2D.h"
+#include "VulkanRenderEngine/VKWrapper/WrapperGeneral.h"
+#include "VulkanRenderEngine/Base/DynamicBlock.h"
+
+
+namespace RenderGraph
+{
+
+	struct TextureDesc {
+		uint32_t width = 0;
+		uint32_t height = 0;
+
+		vk::Format format = vk::Format::eR8G8B8A8Unorm;
+		vk::Filter minFilter = vk::Filter::eLinear;
+		vk::Filter magFilter = vk::Filter::eLinear;
+		vk::SamplerAddressMode wrapU = vk::SamplerAddressMode::eClampToEdge;
+		vk::SamplerAddressMode wrapV = vk::SamplerAddressMode::eClampToEdge;
+
+		uint32_t maxLevel = 1;
+		bool isVariable = false;
+	};
+
+	class TextureHandle
+	{
+	public:
+		TextureHandle() : _id(0) {}
+		explicit TextureHandle(uint32_t id, const TextureDesc& desc) : _id(id), _desc(desc) {}
+		uint32_t GetID() const { return _id; }
+		TextureDesc GetDesc() const { return _desc; }
+		bool IsValid() const { return _id != 0; }
+		bool operator==(const TextureHandle& other) const { return _id == other._id; }
+		explicit operator bool() const { return _id > 0; }
+
+	private:
+		uint32_t _id = 0;
+		TextureDesc _desc;
+	};
+
+	struct PassFrameContext
+	{
+		std::string passName;
+
+		std::vector<std::shared_ptr<Texture2D>> inputTextures;
+		std::vector<std::shared_ptr<Texture2D>> optionInputTextures;
+		std::vector<std::shared_ptr<Texture2D>> outputTextures;
+		std::vector<std::shared_ptr<Texture2D>> tempTextures;
+		std::vector<std::shared_ptr<Texture2D>> persitentTextures;
+		std::vector<std::shared_ptr<Texture2D>> externalTextures;
+
+		const std::string& GetName() const { return passName; };
+		std::shared_ptr<Texture2D> GetInput(uint32_t idx) const { return idx >= 0 && idx < inputTextures.size() ? inputTextures[idx] : nullptr; };
+		std::shared_ptr<Texture2D> GetOptionalInput(uint32_t idx) const { return idx >= 0 && idx < optionInputTextures.size() ? optionInputTextures[idx] : nullptr; };
+		std::shared_ptr<Texture2D> GetOutput(uint32_t idx) const { return idx >= 0 && idx < outputTextures.size() ? outputTextures[idx] : nullptr; };
+		std::shared_ptr<Texture2D> GetTemp(uint32_t idx) const { return idx >= 0 && idx < tempTextures.size() ? tempTextures[idx] : nullptr; };
+		std::shared_ptr<Texture2D> GetPersitent(uint32_t idx) const { return idx >= 0 && idx < persitentTextures.size() ? persitentTextures[idx] : nullptr; };
+		std::shared_ptr<Texture2D> GetExternal(uint32_t idx) const { return idx >= 0 && idx < externalTextures.size() ? externalTextures[idx] : nullptr; };
+	};
+
+	using ResourceName = std::string;
+
+	enum class ResourceType { Texture };
+	struct RenderGraphResource
+	{
+		ResourceName name;
+		ResourceType type;
+		std::variant<TextureDesc> desc;
+
+		bool operator==(const RenderGraphResource& other) const { return name == other.name && type == other.type; }
+		bool operator!=(const RenderGraphResource& other) const { return name != other.name || type != other.type; }
+	};
+
+	struct ExternalResource
+	{
+		ResourceName name;
+		ResourceType type;
+
+		bool operator==(const ExternalResource& other) const { return name == other.name && type == other.type; }
+		bool operator!=(const ExternalResource& other) const { return name != other.name || type != other.type; }
+	};
+
+	struct TextureLayout
+	{
+		ImageLayout::BindStage stage;
+		ImageLayout::BindUsage usage;
+	};
+
+	struct RenderGraphResourceLayout
+	{
+		std::variant<TextureLayout> data;
+	};
+
+	class FrameDataRegistry
+	{
+	public:
+		template<typename T>
+		void Store(const std::string& name, T&& value) {
+			data[name] = std::forward<T>(value);
+		}
+
+		template<typename T>
+		void Store(const std::string& name, const T& value) {
+			data[name] = value;
+		}
+
+		template<typename T>
+		T Load(const std::string& name) const {
+			auto it = data.find(name);
+			if (it == data.end()) {
+				throw std::runtime_error("Frame data not found: " + name);
+			}
+			return std::any_cast<T>(it->second);
+		}
+
+		template<typename T>
+		T& Load(const std::string& name) {
+			auto it = data.find(name);
+			if (it == data.end()) {
+				throw std::runtime_error("Frame data not found: " + name);
+			}
+			return std::any_cast<T&>(it->second);
+		}
+
+		template<typename T>
+		T* TryLoad(const std::string& name) {
+			auto it = data.find(name);
+			if (it == data.end()) {
+				return nullptr;
+			}
+			return std::any_cast<T>(&it->second);
+		}
+
+		// 检查是否存在
+		bool Has(const std::string& name) const {
+			return data.find(name) != data.end();
+		}
+
+		void Clear() {
+			data.clear();
+		}
+
+		template<typename T>
+		std::shared_ptr<T> Get(const std::string& name) {
+			if (auto ptr = TryLoad<std::shared_ptr<T>>(name); ptr && *ptr)
+				return *ptr;
+			auto res = std::make_shared<T>();
+			Store(name, res);
+			return res;
+		}
+
+		std::shared_ptr<UniformBlock> GetUniformBlock(const std::string& name) {
+			return Get<UniformBlock>(name);
+		}
+
+		std::shared_ptr<StorageBlock> GetStorageBlock(const std::string& name) {
+			return Get<StorageBlock>(name);
+		}
+
+		std::shared_ptr<VertexBufferBlock> GetVertexBlock(const std::string& name) {
+			return Get<VertexBufferBlock>(name);
+		}
+
+		std::shared_ptr<IndexBufferBlock> GetIndexBlock(const std::string& name) {
+			return Get<IndexBufferBlock>(name);
+		}
+
+		std::shared_ptr<IndirectBufferBlock> GetIndirectBlock(const std::string& name) {
+			return Get<IndirectBufferBlock>(name);
+		}
+
+		std::shared_ptr<SBTBufferBlock> GetSBTBlock(const std::string& name) {
+			return Get<SBTBufferBlock>(name);
+		}
+
+	private:
+		std::unordered_map<std::string, std::any> data;
+	};
+
+
+	class PassFrameCmdContext;
+	class PassFrameCmd :public VKWrapper::VKCommandBuffer
+	{
+	public:
+		PassFrameCmd(PassFrameCmdContext* ctx);
+		PassFrameCmd(PassFrameCmd&& other);
+		virtual ~PassFrameCmd() = default;
+
+		virtual void SubmitToQueue(const CmdSyncSeamphore& syncSeamphore = {}, std::shared_ptr<VKWrapper::VKFence> signalFence = nullptr);
+		virtual void SubmitNow(const CmdSyncSeamphore& syncSeamphore = {}, std::shared_ptr<VKWrapper::VKFence> signalFence = nullptr);
+		virtual void SubmitNowAndWait(const CmdSyncSeamphore& syncSeamphore = {});
+
+	private:
+		PassFrameCmdContext* _ctx = nullptr;
+	};
+
+	class PassFrameCmdContext
+	{
+	private:
+		struct TexLayoutData {
+			std::shared_ptr<Texture2D> tex;
+			RenderGraphResourceLayout layout;
+		};
+
+	public:
+		PassFrameCmdContext(const std::shared_ptr<CriticalSectionLock>& mutex);
+		~PassFrameCmdContext();
+
+		std::shared_ptr<PassFrameCmd> GetCmd();
+
+		void SubmitToQueue(const std::shared_ptr<VKWrapper::VKCommandBuffer>& cmd, const CmdSyncSeamphore& syncSeamphore = {}, std::shared_ptr<VKWrapper::VKFence> signalFence = nullptr);
+		void SubmitNow(const std::shared_ptr<VKWrapper::VKCommandBuffer>& cmd, const CmdSyncSeamphore& syncSeamphore = {}, std::shared_ptr<VKWrapper::VKFence> signalFence = nullptr);
+		void SubmitNowAndWait(const std::shared_ptr<VKWrapper::VKCommandBuffer>& cmd, const CmdSyncSeamphore& syncSeamphore = {});
+
+		void PushTexWithLayout(const std::shared_ptr<Texture2D>& tex, const RenderGraphResourceLayout& layout);
+
+	public:
+		void Start();
+		void End();
+
+	private:
+		void StartupCmd();
+		void Need();
+
+	private:
+		struct PassFrameSubmitCMDData
+		{
+			std::shared_ptr<VKWrapper::VKCommandBuffer> cmd;
+			CmdSyncSeamphore syncSeamphore;
+			std::shared_ptr<VKWrapper::VKFence> signalFence;
+		};
+
+	private:
+		bool _isEnd;
+		bool _immediatelySubmit;
+		uint32_t cmdcount = 0;
+		std::queue<PassFrameSubmitCMDData> _submitcmds;
+		std::shared_ptr<VKWrapper::VKTimelineSemaphore> _timeLine;
+		std::shared_ptr<CriticalSectionLock> _mutex;
+		std::vector<TexLayoutData> _texDatas;
+	};
+}
+
+namespace std {
+	template<> struct hash<RenderGraph::TextureHandle> {
+		size_t operator()(const RenderGraph::TextureHandle& handle) const {
+			return hash<uint32_t>()(handle.GetID());
+		}
+	};
+}
+
+namespace std {
+	template<> struct hash<RenderGraph::RenderGraphResource> {
+		size_t operator()(const RenderGraph::RenderGraphResource& res) const {
+			size_t h1 = std::hash<std::string>{}(res.name);
+			size_t h2 = std::hash<int>{}(static_cast<int>(res.type));
+			return h1 ^ (h2 << 1);
+		}
+	};
+}
